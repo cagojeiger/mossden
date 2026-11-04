@@ -1,0 +1,263 @@
+import base64
+import copy
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from urllib.parse import unquote
+
+import ci_bridge as bridge
+
+
+CONFIG = json.loads((Path(__file__).parents[1] / "ci-bridge.json").read_text())
+REVISION = "2" * 40
+SOURCE_SHA = "1" * 40
+
+
+class Clock:
+    def __init__(self):
+        self.value = 1700000050
+
+    def __call__(self):
+        return self.value
+
+    def pause(self, seconds):
+        self.value += seconds
+
+
+class Provider:
+    """A tiny provider fake: writes can take effect before losing their response."""
+    def __init__(self, clock):
+        self.clock, self.files, self.runs = clock, {}, {}
+        self.mutations = []
+        self.lost_create = self.lost_update = self.lost_post = False
+        self.source = {
+            "id": 11, "run_attempt": 1, "workflow_id": 101, "path": ".github/workflows/ci.yml",
+            "repository": {"id": CONFIG["source_repository_id"]},
+            "head_repository": {"id": CONFIG["source_repository_id"]},
+            "head_branch": "main", "event": "push", "head_sha": SOURCE_SHA,
+            "status": "in_progress", "created_at": bridge.utc(1700000000),
+        }
+
+    def run(self, run_id, digest, nonce):
+        return {
+            "id": run_id, "run_attempt": 1, "workflow_id": 201, "path": ".github/workflows/ci.yml",
+            "repository": {"id": CONFIG["public_repository_id"]},
+            "head_repository": {"id": CONFIG["public_repository_id"]},
+            "actor": {"id": CONFIG["dispatch_actor_id"]},
+            "triggering_actor": {"id": CONFIG["dispatch_actor_id"]},
+            "head_branch": "main", "event": "workflow_dispatch", "head_sha": REVISION,
+            "display_title": f"bridge:{digest}:{nonce}", "status": "in_progress", "conclusion": None,
+            "created_at": bridge.utc(int(self.clock())),
+        }
+
+    def request(self, public, path, data=None, method="GET", missing=False):
+        bare = path.split("?")[0]
+        repository = "repos/" + CONFIG["public_repository" if public else "source_repository"]
+        relative = bare.removeprefix(repository)
+        if method != "GET":
+            self.mutations.append((public, method, relative))
+        if relative.startswith("/contents/"):
+            filename = unquote(relative.removeprefix("/contents/"))
+            if method == "GET":
+                if filename not in self.files:
+                    if missing:
+                        return None
+                    raise bridge.ApiFailure(404)
+                value, blob_sha = self.files[filename]
+                raw = bridge.compact(value)
+                return {"sha": blob_sha, "size": len(raw), "encoding": "base64",
+                        "content": base64.b64encode(raw).decode()}
+            existing = self.files.get(filename)
+            if (existing and data.get("sha") != existing[1]) or (not existing and "sha" in data):
+                raise bridge.ApiFailure(409)
+            value = json.loads(base64.b64decode(data["content"]))
+            blob_sha = hashlib.sha1(bridge.compact(value)).hexdigest()
+            self.files[filename] = (value, blob_sha)
+            if (existing and self.lost_update) or (not existing and self.lost_create):
+                self.lost_create = self.lost_update = False
+                raise bridge.ApiFailure()
+            return {"content": {"sha": blob_sha}}
+        if relative == "":
+            return {"id": CONFIG["public_repository_id" if public else "source_repository_id"],
+                    "full_name": repository.removeprefix("repos/"), "private": not public}
+        if relative == "/branches/main":
+            return {"commit": {"sha": REVISION}}
+        if relative == "/branches/ci-state":
+            return {"commit": {"commit": {"tree": {"sha": "3" * 40}}}}
+        if relative.startswith("/git/trees/"):
+            return {"truncated": False, "tree": [{"path": filename, "type": "blob"} for filename in self.files]}
+        if relative == "/actions/workflows/ci.yml":
+            return {"id": 201 if public else 101, "path": ".github/workflows/ci.yml", "state": "active"}
+        if relative == "/actions/workflows/ci.yml/dispatches":
+            inputs = data["inputs"]
+            self.runs[21] = self.run(21, inputs["request_digest"], inputs["claim_nonce"])
+            if self.lost_post:
+                self.lost_post = False
+                raise bridge.ApiFailure()
+            return None
+        if relative == "/actions/workflows/201/runs":
+            return {"total_count": len(self.runs), "workflow_runs": list(copy.deepcopy(self.runs).values())}
+        if not public and relative in ("/actions/runs/11", "/actions/runs/11/attempts/1"):
+            return copy.deepcopy(self.source)
+        if public and relative.startswith("/actions/runs/"):
+            pieces = relative.split("/")
+            run_id = int(pieces[3])
+            if relative.endswith("/cancel"):
+                # HTTP acceptance does not change actual execution state.
+                return None
+            if relative.endswith("/jobs"):
+                return {"total_count": 1, "jobs": [{
+                    "id": 31, "run_id": run_id, "run_attempt": 1, "head_sha": REVISION,
+                    "name": "Rust", "status": "completed", "conclusion": "success",
+                }]}
+            return copy.deepcopy(self.runs[run_id])
+        raise AssertionError((public, path, method))
+
+
+class Api:
+    def __init__(self, provider, public):
+        self.provider, self.public = provider, public
+        self.deadline = provider.clock() + 300
+
+    def request(self, path, data=None, method="GET", missing=False):
+        return self.provider.request(self.public, path, data, method, missing)
+
+
+class BridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.provider = Provider(self.clock)
+        self.control = bridge.Bridge(CONFIG, Api(self.provider, False), Api(self.provider, True), REVISION,
+                                     self.clock, self.clock.pause)
+
+    def posts(self):
+        return [call for call in self.provider.mutations if call[2].endswith("/dispatches")]
+
+    def complete(self):
+        self.provider.runs[21].update(status="completed", conclusion="success")
+
+    def test_request_digest_matches_the_existing_rust_v1_golden(self):
+        request = self.control.source_request(11, 1)
+        request["source_run_id"] = 1001
+        # Independent Rust fixture from the offline ci-bridge skeleton.
+        self.assertEqual(bridge.digest(request),
+                         "a4232d2e139268763c7b4e897306cde6d017dca47f6888d0b4f1f9c514f71468")
+
+    def test_normal_gate_and_result_acceptance(self):
+        claim = self.control.dispatch(11, 1)
+        self.assertEqual(self.control.gate(11, 1, claim["request_digest"], claim["nonce"], 21, 1, REVISION), SOURCE_SHA)
+        self.complete()
+        self.assertEqual(self.control.wait(11, 1)["public_run_id"], 21)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_lost_dispatch_response_never_reposts_even_after_restart(self):
+        self.provider.lost_post = True
+        self.assertEqual(self.control.dispatch(11, 1)["public_run_id"], 21)
+        self.assertEqual(self.control.dispatch(11, 1)["public_run_id"], 21)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_uncertain_claim_create_never_grants_permission(self):
+        self.provider.lost_create = True
+        with self.assertRaises(bridge.Stopped):
+            self.control.dispatch(11, 1)
+        self.assertEqual(len(self.provider.files), 1)  # Write really took effect.
+        with self.assertRaises(bridge.Stopped):
+            self.control.dispatch(11, 1)
+        self.assertEqual(self.posts(), [])
+
+    def test_lost_binding_response_requires_exact_intended_readback(self):
+        self.provider.lost_update = True
+        claim = self.control.dispatch(11, 1)
+        self.assertEqual(claim["public_run_id"], 21)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_binding_is_immutable(self):
+        claim = self.control.dispatch(11, 1)
+        self.provider.runs[22] = self.provider.run(22, claim["request_digest"], claim["nonce"])
+        with self.assertRaisesRegex(bridge.Stopped, "immutable"):
+            self.control.bind(claim["request"], self.control.claim(claim["request"]), 22)
+
+    def test_wrong_public_provenance_is_rejected(self):
+        claim = self.control.dispatch(11, 1)
+        self.complete()
+        for key, value in (("head_sha", "f" * 40), ("run_attempt", 2), ("actor", {"id": 999})):
+            with self.subTest(key=key):
+                original = self.provider.runs[21][key]
+                self.provider.runs[21][key] = value
+                with self.assertRaises(bridge.Stopped):
+                    self.control.verify_results(claim)
+                self.provider.runs[21][key] = original
+
+    def test_success_after_original_deadline_is_rejected(self):
+        claim = self.control.dispatch(11, 1)
+        self.complete()
+        self.clock.value = claim["deadline"]
+        with self.assertRaisesRegex(bridge.Stopped, "deadline"):
+            self.control.verify_results(claim)
+
+    def test_wrong_job_run_identity_is_rejected(self):
+        claim = self.control.dispatch(11, 1)
+        self.complete()
+        original = self.control.public.request
+
+        def altered(path, *args, **kwargs):
+            result = original(path, *args, **kwargs)
+            if "jobs?" in path:
+                result["jobs"][0]["run_id"] = 999
+            return result
+
+        self.control.public.request = altered
+        with self.assertRaisesRegex(bridge.Stopped, "evidence"):
+            self.control.verify_results(claim)
+
+    def test_source_attempt_change_revokes_gate(self):
+        claim = self.control.dispatch(11, 1)
+        self.provider.source["run_attempt"] = 2
+        with self.assertRaises(bridge.Stopped):
+            self.control.gate(11, 1, claim["request_digest"], claim["nonce"], 21, 1, REVISION)
+
+    def test_cancel_acknowledgement_is_not_terminal_receipt(self):
+        claim = self.control.dispatch(11, 1)
+        self.provider.source["status"] = "completed"
+        self.control.reconcile_claim(self.control.path(claim["request"]))
+        self.assertTrue(any(call[2].endswith("/cancel") for call in self.provider.mutations))
+        self.assertFalse(any(path.startswith("settled/") for path in self.provider.files))
+        self.complete()
+        self.control.reconcile_claim(self.control.path(claim["request"]))
+        self.assertTrue(any(path.startswith("settled/") for path in self.provider.files))
+
+    def test_delivery_created_after_deadline_is_cancelled_then_observed(self):
+        request = self.control.source_request(11, 1)
+        (claim, _), _ = self.control.acquire(request)
+        self.clock.value = request["deadline"] + 10
+        self.provider.runs[21] = self.provider.run(21, claim["request_digest"], claim["nonce"])
+        with self.assertRaisesRegex(bridge.Stopped, "window"):
+            self.control.public_run(claim, 21)
+        self.control.reconcile_claim(self.control.path(request))
+        self.assertTrue(any(call[2].endswith("/cancel") for call in self.provider.mutations))
+        self.assertFalse(any(path.startswith("settled/") for path in self.provider.files))
+        self.complete()
+        self.control.reconcile_claim(self.control.path(request))
+        self.assertTrue(any(path.startswith("settled/") for path in self.provider.files))
+        self.assertEqual(self.posts(), [])
+
+    def test_private_wrapper_suppresses_output_and_command_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command_file = Path(directory) / "public-output"
+            command_file.write_text("sentinel")
+            wrapper = Path(__file__).with_name("private_run.sh")
+            script = 'printf "::error::private-source\\n"; echo private-stderr >&2; echo secret > "$GITHUB_OUTPUT"; exit 17'
+            result = subprocess.run(["bash", str(wrapper), "bash", "-c", script],
+                                    capture_output=True, text=True, env={"PATH": __import__("os").environ["PATH"],
+                                                                       "GITHUB_OUTPUT": str(command_file)})
+            self.assertEqual(result.returncode, 17)
+            self.assertNotIn("private-source", result.stdout + result.stderr)
+            self.assertNotIn("private-stderr", result.stdout + result.stderr)
+            self.assertEqual(command_file.read_text(), "sentinel")
+
+
+if __name__ == "__main__":
+    unittest.main()

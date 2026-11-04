@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "source_repository": "cagojeiger/mossden-core",
+  "source_repository_id": 1430400331,
+  "public_repository": "cagojeiger/mossden",
+  "public_repository_id": 1444279727,
+  "source_workflow": "ci.yml",
+  "public_workflow": "ci.yml",
+  "state_branch": "ci-state",
+  "required_jobs": ["Rust"],
+  "deadline_seconds": 3600,
+  "dispatch_actor_id": 352203391
+}
