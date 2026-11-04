@@ -44,6 +44,23 @@ evidence, rereads binding and source status, and rechecks the original deadline.
 Only its exit 0 means accepted success. Separate API reads are not an atomic
 transaction; the Quint model's atomic acceptance remains an abstraction.
 
+Each bound-run wait cycle checks the source, workflow state, claim and public
+run every ten seconds. It reuses the run already observed in that cycle: four
+core GETs and two public GETs, compared with seven and four. Initial dispatch
+discovery performs two additional public GETs once after binding.
+
+Authenticated wait polling uses per-API, per-credential, exact-path ETags. Every
+reuse requires an online `304 Not Modified` response; errors never return cached
+data. Cached values are copied, and the cache is disabled before final result
+verification and cleared whenever waiting exits. Final job, binding, source and
+deadline verification remains unconditional.
+
+Authorized `304` responses do not consume GitHub's primary rate limit. Actual
+savings depend on endpoint support and how often responses change; this is not a
+measured wall-clock speedup or a complete API-budget solution. Reconciliation
+history, cancellation authority, request schemas and trusted pins are unchanged.
+See [GitHub's conditional request guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests).
+
 `reconcile` observes all claims, adopts a unique eligible run, cancels expired,
 inactive or duplicate executions, and writes per-run `settled/` evidence only
 after observing `status=completed`. A cancel response is not termination.

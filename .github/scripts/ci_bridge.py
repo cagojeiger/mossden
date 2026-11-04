@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -99,6 +100,7 @@ class Api:
     def __init__(self, token=None, clock=time.time, pause=time.sleep):
         self.token, self.clock, self.pause = token, clock, pause
         self.deadline = self.clock() + 300
+        self.poll_cache = None
 
     def request(self, path, data=None, method="GET", missing=False):
         require(not path.startswith("/") and "://" not in path, "Invalid API path")
@@ -109,6 +111,11 @@ class Api:
         body = compact(data) if data is not None else None
         if body is not None:
             headers["Content-Type"] = "application/json"
+        cache = self.poll_cache if method == "GET" and data is None and self.token else None
+        key = (self.token, path)
+        cached = cache.get(key) if cache is not None else None
+        if cached is not None:
+            headers["If-None-Match"] = cached[0]
         # A mutation is sent ONCE. An absent response is never evidence of no effect.
         for attempt in range(3 if method == "GET" else 1):
             remaining = self.deadline - self.clock()
@@ -118,8 +125,18 @@ class Api:
                 with build_opener(NoRedirect).open(request, timeout=min(15, remaining)) as response:
                     raw = response.read(2 * 1024 * 1024 + 1)
                     require(len(raw) <= 2 * 1024 * 1024, "API response is too large")
-                    return decode(raw) if raw else None
+                    value = decode(raw) if raw else None
+                    if cache is not None:
+                        etag = response.headers.get("ETag")
+                        if etag:
+                            cache[key] = (etag, copy.deepcopy(value))
+                        else:
+                            cache.pop(key, None)
+                    return value
             except HTTPError as error:
+                error.close()
+                if error.code == 304 and cached is not None:
+                    return copy.deepcopy(cached[1])
                 if method == "GET" and missing and error.code == 404:
                     return None
                 if method != "GET" or error.code not in (429, 500, 502, 503, 504) or attempt == 2:
@@ -342,12 +359,12 @@ class Bridge:
             require(entry is not None, "Claim disappeared")
             claim = entry[0]
             if claim["public_run_id"] is not None:
-                self.public_run(claim, claim["public_run_id"])
-                return entry
+                return entry, self.public_run(claim, claim["public_run_id"])
             runs = self.candidates(claim)
             require(len(runs) <= 1, "Ambiguous public runs; no binding is permitted")
             if runs:
-                return self.bind(request, entry, runs[0]["id"])
+                entry = self.bind(request, entry, runs[0]["id"])
+                return entry, self.public_run(entry[0], runs[0]["id"])
             self.pause(min(5, max(0, end - self.clock())))
         raise Stopped("Public execution was not bound; observe or reconcile, never redispatch")
 
@@ -372,7 +389,7 @@ class Bridge:
                                     data, method="POST")
             except Stopped:
                 pass
-        return self.observe_binding(request)[0]
+        return self.observe_binding(request)[0][0]
 
     def gate(self, run_id, attempt, request_digest, nonce, public_run_id, public_attempt, public_sha):
         require(public_attempt == 1 and public_sha == self.revision, "Untrusted public execution revision or attempt")
@@ -417,18 +434,21 @@ class Bridge:
         self.before_deadline(claim["request"])
 
     def wait(self, run_id, attempt):
-        request = self.source_request(run_id, attempt)
-        self.core.deadline = self.public.deadline = request["deadline"]
-        while self.clock() < request["deadline"]:
-            self.active(request)
-            entry = self.observe_binding(request)
-            claim = entry[0]
-            run = self.public_run(claim, claim["public_run_id"])
-            if run.get("status") == "completed":
-                self.verify_results(claim)
-                return claim
-            self.pause(min(10, max(0, request["deadline"] - self.clock())))
-        raise Stopped("Original source deadline elapsed")
+        self.core.poll_cache, self.public.poll_cache = {}, {}
+        try:
+            request = self.source_request(run_id, attempt)
+            self.core.deadline = self.public.deadline = request["deadline"]
+            while self.clock() < request["deadline"]:
+                entry, run = self.observe_binding(request)
+                claim = entry[0]
+                if run.get("status") == "completed":
+                    self.core.poll_cache = self.public.poll_cache = None
+                    self.verify_results(claim)
+                    return claim
+                self.pause(min(10, max(0, request["deadline"] - self.clock())))
+            raise Stopped("Original source deadline elapsed")
+        finally:
+            self.core.poll_cache = self.public.poll_cache = None
 
     def terminal_receipt(self, claim, run):
         require(run.get("status") == "completed", "Cancellation acknowledgement is not termination")
