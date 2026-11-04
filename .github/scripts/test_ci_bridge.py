@@ -1,11 +1,14 @@
 import base64
 import copy
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.parse import unquote
 
 import ci_bridge as bridge
@@ -126,6 +129,135 @@ class Api:
         return self.provider.request(self.public, path, data, method, missing)
 
 
+def response(value, etag=None):
+    result = io.BytesIO(bridge.compact(value))
+    result.headers = {"ETag": etag} if etag else {}
+    return result
+
+
+class HttpProvider:
+    """Exercise the real Api with online ETag validation, not a local cache hit."""
+    def __init__(self, provider, core_budget=1000):
+        self.provider, self.core_budget = provider, core_budget
+        self.calls = []
+
+    def open(self, request, timeout):
+        path = request.full_url.removeprefix("https://api.github.com/")
+        public = path.startswith("repos/" + CONFIG["public_repository"] + "/")
+        method = request.get_method()
+        try:
+            value = self.provider.request(public, path,
+                                          bridge.decode(request.data) if request.data else None, method)
+        except bridge.ApiFailure as error:
+            raise HTTPError(request.full_url, error.status or 503, "fixture", {}, io.BytesIO()) from None
+        etag = '"' + hashlib.sha256(bridge.compact(value)).hexdigest() + '"'
+        conditional = request.get_header("If-none-match")
+        status = 304 if method == "GET" and conditional == etag else 200
+        if not public and status != 304 and sum(not call["public"] and call["status"] != 304
+                                               for call in self.calls) >= self.core_budget:
+            status = 403
+        self.calls.append({"public": public, "path": path, "status": status,
+                           "conditional": conditional, "method": method})
+        if status != 200:
+            raise HTTPError(request.full_url, status, "fixture", {"ETag": etag}, io.BytesIO())
+        return response(value, etag)
+
+
+class ApiTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.api = bridge.Api("first-token", self.clock, self.clock.pause)
+        self.api.poll_cache = {}
+
+    def test_online_304_reuses_an_isolated_copy(self):
+        unchanged = HTTPError("https://api.github.com/example", 304, "unchanged", {}, io.BytesIO())
+        with patch.object(bridge, "build_opener") as opener:
+            opener.return_value.open.side_effect = [response({"items": [1]}, '"v1"'), unchanged, unchanged]
+            first = self.api.request("example")
+            first["items"].append(2)
+            second = self.api.request("example")
+            second["items"].append(3)
+            self.assertEqual(self.api.request("example"), {"items": [1]})
+            self.assertEqual(opener.return_value.open.call_count, 3)
+            self.assertEqual(opener.return_value.open.call_args.args[0].get_header("If-none-match"), '"v1"')
+
+    def test_changed_200_replaces_the_cached_representation(self):
+        unchanged = HTTPError("https://api.github.com/example", 304, "unchanged", {}, io.BytesIO())
+        with patch.object(bridge, "build_opener") as opener:
+            opener.return_value.open.side_effect = [response({"value": 1}, '"v1"'),
+                                                       response({"value": 2}, '"v2"'), unchanged]
+            self.api.request("example")
+            self.assertEqual(self.api.request("example"), {"value": 2})
+            self.assertEqual(self.api.request("example"), {"value": 2})
+            self.assertEqual(opener.return_value.open.call_args.args[0].get_header("If-none-match"), '"v2"')
+
+    def test_cache_is_scoped_to_exact_path_and_current_credentials(self):
+        with patch.object(bridge, "build_opener") as opener:
+            opener.return_value.open.side_effect = [response({}, '"v1"') for _ in range(3)]
+            self.api.request("example?attempt=1")
+            self.api.request("example?attempt=2")
+            self.api.token = "replacement-token"
+            self.api.request("example?attempt=1")
+            requests = [call.args[0] for call in opener.return_value.open.call_args_list]
+            self.assertTrue(all(request.get_header("If-none-match") is None for request in requests))
+            self.assertEqual(requests[-1].get_header("Authorization"), "Bearer replacement-token")
+
+    def test_errors_never_fall_back_to_cached_data(self):
+        for status in (403, 503):
+            with self.subTest(status=status), patch.object(bridge, "build_opener") as opener:
+                self.api.poll_cache = {}
+                opener.return_value.open.side_effect = [response({}, '"v1"')] + [
+                    HTTPError("https://api.github.com/example", status, "failed", {}, io.BytesIO())
+                    for _ in range(1 if status == 403 else 3)]
+                self.api.request("example")
+                with self.assertRaises(bridge.ApiFailure) as error:
+                    self.api.request("example")
+                self.assertEqual(error.exception.status, status)
+                self.assertEqual(opener.return_value.open.call_count, 2 if status == 403 else 4)
+
+    def test_unrequested_304_cannot_supply_a_representation(self):
+        for token in (None, "token"):
+            with self.subTest(token=token), patch.object(bridge, "build_opener") as opener:
+                self.api.token = token
+                opener.return_value.open.side_effect = HTTPError("https://api.github.com/example", 304,
+                                                                  "unexpected", {}, io.BytesIO())
+                with self.assertRaises(bridge.ApiFailure):
+                    self.api.request("example")
+
+    def test_missing_etag_and_unauthenticated_reads_are_not_cached(self):
+        with patch.object(bridge, "build_opener") as opener:
+            opener.return_value.open.side_effect = [response({}, '"v1"'), response({}), response({})]
+            self.api.request("example")
+            self.api.request("example")
+            self.api.request("example")
+            self.assertIsNone(opener.return_value.open.call_args.args[0].get_header("If-none-match"))
+        self.api.token = None
+        with patch.object(bridge, "build_opener") as opener:
+            opener.return_value.open.side_effect = [response({}, '"v1"') for _ in range(2)]
+            self.api.request("example")
+            self.api.request("example")
+            self.assertIsNone(opener.return_value.open.call_args.args[0].get_header("If-none-match"))
+
+    def test_failed_mutation_is_never_retried(self):
+        with patch.object(bridge, "build_opener") as opener:
+            opener.return_value.open.side_effect = HTTPError("https://api.github.com/example", 503,
+                                                              "uncertain", {}, io.BytesIO())
+            with self.assertRaises(bridge.ApiFailure):
+                self.api.request("example", {}, method="POST")
+            self.assertEqual(opener.return_value.open.call_count, 1)
+
+    def test_disabled_cache_and_mutations_are_unconditional(self):
+        with patch.object(bridge, "build_opener") as opener:
+            opener.return_value.open.side_effect = [response({}, '"v1"') for _ in range(4)]
+            self.api.request("example")
+            self.api.request("example", {}, method="POST")
+            self.api.poll_cache = None
+            self.api.request("example")
+            self.api.request("example")
+            requests = [call.args[0] for call in opener.return_value.open.call_args_list]
+            self.assertTrue(all(request.get_header("If-none-match") is None for request in requests))
+
+
 class BridgeTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
@@ -152,6 +284,102 @@ class BridgeTests(unittest.TestCase):
         self.complete()
         self.assertEqual(self.control.wait(11, 1)["public_run_id"], 21)
         self.assertEqual(len(self.posts()), 1)
+
+    def test_bound_wait_cycle_retains_guards_with_four_core_and_two_public_gets(self):
+        self.control.dispatch(11, 1)
+        counts, cycles = [0, 0], []
+        for index, api in enumerate((self.control.core, self.control.public)):
+            original = api.request
+
+            def counted(*args, index=index, original=original, **kwargs):
+                counts[index] += 1
+                return original(*args, **kwargs)
+
+            api.request = counted
+
+        def pause(seconds):
+            cycles.append(tuple(counts))
+            counts[:] = [0, 0]
+            self.clock.pause(seconds)
+            if len(cycles) == 2:
+                raise bridge.Stopped("end sampled polling")
+
+        self.control.pause = pause
+        with self.assertRaisesRegex(bridge.Stopped, "sampled"):
+            self.control.wait(11, 1)
+        self.assertEqual(cycles, [(7, 2), (4, 2)])  # Initial source read costs three core GETs.
+        self.assertIsNone(self.control.core.poll_cache)
+        self.assertIsNone(self.control.public.poll_cache)
+
+    def test_stable_long_wait_revalidates_online_and_final_acceptance_is_uncached(self):
+        self.control.dispatch(11, 1)
+        transport = HttpProvider(self.provider)
+        finish = self.clock() + 2700
+
+        def pause(seconds):
+            self.clock.pause(seconds)
+            if self.clock() >= finish:
+                self.complete()
+
+        self.control = bridge.Bridge(CONFIG, bridge.Api("core", self.clock, self.clock.pause),
+                                     bridge.Api("public", self.clock, self.clock.pause), REVISION,
+                                     self.clock, pause)
+        with patch.object(bridge, "build_opener", return_value=transport):
+            self.assertEqual(self.control.wait(11, 1)["public_run_id"], 21)
+        self.assertTrue(any(call["status"] == 304 for call in transport.calls))
+        self.assertLess(sum(not call["public"] and call["status"] == 200
+                            for call in transport.calls), 1000)
+        self.assertTrue(all(call["conditional"] is None for call in transport.calls[-9:]))
+        self.assertIsNone(self.control.core.poll_cache)
+        self.assertIsNone(self.control.public.poll_cache)
+
+    def test_final_source_change_is_rejected_after_cached_polling(self):
+        self.control.dispatch(11, 1)
+        transport = HttpProvider(self.provider)
+
+        def pause(seconds):
+            self.clock.pause(seconds)
+            self.complete()
+
+        self.control = bridge.Bridge(CONFIG, bridge.Api("core", self.clock, self.clock.pause),
+                                     bridge.Api("public", self.clock, self.clock.pause), REVISION,
+                                     self.clock, pause)
+        verify = self.control.verify_results
+
+        def changed(claim):
+            self.assertIsNone(self.control.core.poll_cache)
+            self.assertIsNone(self.control.public.poll_cache)
+            self.provider.source["run_attempt"] = 2
+            verify(claim)
+
+        self.control.verify_results = changed
+        with patch.object(bridge, "build_opener", return_value=transport):
+            with self.assertRaises(bridge.Stopped):
+                self.control.wait(11, 1)
+        self.assertTrue(any(call["status"] == 304 for call in transport.calls))
+        self.assertIsNone(self.control.core.poll_cache)
+        self.assertIsNone(self.control.public.poll_cache)
+
+    def test_wait_still_stops_at_the_original_deadline(self):
+        claim = self.control.dispatch(11, 1)
+        with self.assertRaisesRegex(bridge.Stopped, "deadline"):
+            self.control.wait(11, 1)
+        self.assertEqual(self.clock(), claim["deadline"])
+        self.assertIsNone(self.control.core.poll_cache)
+        self.assertIsNone(self.control.public.poll_cache)
+
+    def test_wait_still_stops_when_the_source_closes(self):
+        self.control.dispatch(11, 1)
+
+        def pause(seconds):
+            self.clock.pause(seconds)
+            self.provider.source["status"] = "completed"
+
+        self.control.pause = pause
+        with self.assertRaisesRegex(bridge.Stopped, "active"):
+            self.control.wait(11, 1)
+        self.assertIsNone(self.control.core.poll_cache)
+        self.assertIsNone(self.control.public.poll_cache)
 
     def test_lost_dispatch_response_never_reposts_even_after_restart(self):
         self.provider.lost_post = True
