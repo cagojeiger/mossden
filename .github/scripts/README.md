@@ -9,7 +9,7 @@ GitHub-hosted public worker fetches the exact private source only after admissio
 | `preflight` | Repository and pinned workflow metadata |
 | `dispatch`, `wait` | `CORE_RUN_ID`, `CORE_ATTEMPT` |
 | `gate` | V2 dispatch inputs and the public run identity |
-| `reconcile` | Exact completed source ID and attempt for `workflow_run`; otherwise a bounded sweep |
+| `reconcile` | Completed workflow name, plus the exact source ID and attempt for a `CI` completion |
 
 The control jobs use `CORE_TOKEN` and a public-only `PUBLIC_TOKEN`. The gate
 uses the private read App token `CORE_READ_TOKEN` and its public job token.
@@ -35,9 +35,11 @@ cancellation authority. An active bound worker is preserved when duplicates
 appear. Cancellation needs its own acknowledged reservation; a cancel response
 does not count as termination.
 
-A completed source event checks that attempt. Scheduled and manual sweeps check
-at most 20 candidates per batch within the API budget and retain a cursor for
-deferred work. A settlement marker is tied to the exact claim blob. A verified
+Source CI publishes the request before waiting. The standalone dispatcher
+waits for that claim before reserving a dispatch. Source CI completion checks
+the exact source attempt. Dispatcher completion, daily schedule, and
+manual runs start a sweep of at most 20 candidates within the API budget.
+A cursor preserves deferred work. A settlement marker is tied to the exact claim blob. A verified
 closed, unbound reservation can be settled after the original deadline plus
 24 hours if no observed worker remains active. Global sweeps still discover late
 active workers for settled requests. Ambiguous reads fail safely and are reported
