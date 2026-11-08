@@ -320,7 +320,8 @@ class Bridge:
         return claim, self.put_file(path, claim)
 
     def acquire(self, request):
-        entry = self.prepare(request)
+        entry = self.claim(request)
+        require(entry is not None, "Source did not publish a V2 request")
         claim = entry[0]
         require(claim["decision"] is None, "Request is already decided")
         if claim["nonce"] is not None:
@@ -413,6 +414,11 @@ class Bridge:
         self.preflight()
         request = self.source_request(run_id, attempt)
         self.core.deadline = self.public.deadline = request["deadline"]
+        publication_deadline = min(request["deadline"], self.clock() + 180)
+        while self.clock() < publication_deadline and self.claim(request) is None:
+            self.active(request)
+            self.pause(min(5, max(0, publication_deadline - self.clock())))
+        require(self.clock() < publication_deadline, "Source publication deadline elapsed")
         entry, permission = self.acquire(request)
         if permission:
             self.active(request)
@@ -511,15 +517,17 @@ class Bridge:
     def wait(self, run_id, attempt):
         request = self.source_request(run_id, attempt)
         self.core.deadline = self.public.deadline = request["deadline"]
+        self.prepare(request)
         while self.clock() < request["deadline"]:
-            entry = self.claim(request)
-            require(entry is not None and entry[0]["decision"] in (None, "success"), "Request is closed")
-            claim = entry[0]
             self.active(request)
-            if claim["public_run_id"] is not None:
-                run = self.public_run(claim, claim["public_run_id"])
-                if run["status"] == "completed":
-                    return self.accept(request)
+            entry = self.claim(request)
+            if entry is not None:
+                claim = entry[0]
+                require(claim["decision"] in (None, "success"), "Request is closed")
+                if claim["public_run_id"] is not None:
+                    run = self.public_run(claim, claim["public_run_id"])
+                    if run["status"] == "completed":
+                        return self.accept(request)
             self.pause(min(15, max(0, request["deadline"] - self.clock())))
         raise Stopped("Original source deadline elapsed")
 
@@ -667,6 +675,19 @@ def environment(name):
     return value
 
 
+def reconcile_event(bridge):
+    event = environment("GITHUB_EVENT_NAME")
+    if event == "workflow_run":
+        workflow = environment("COMPLETED_WORKFLOW")
+        if workflow == "CI":
+            return bridge.reconcile(integer(environment("COMPLETED_RUN_ID")),
+                                    integer(environment("COMPLETED_RUN_ATTEMPT")))
+        require(workflow == "Dispatch public CI", "Unexpected completed workflow")
+    else:
+        require(event in ("schedule", "workflow_dispatch"), "Unexpected reconciliation event")
+    return bridge.reconcile()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("preflight", "dispatch", "gate", "wait", "reconcile"))
@@ -681,13 +702,9 @@ def main():
     if args.command == "preflight":
         bridge.preflight()
     elif args.command == "reconcile":
-        event = os.environ.get("GITHUB_EVENT_NAME")
-        if event == "workflow_run":
-            result = bridge.reconcile(integer(environment("COMPLETED_RUN_ID")),
-                                      integer(environment("COMPLETED_RUN_ATTEMPT")))
+        result = reconcile_event(bridge)
+        if result is not None:
             print(json.dumps(result))
-        else:
-            bridge.reconcile()
     elif gate:
         require(environment("INPUT_REQUEST_VERSION") == str(VERSION), "Unsupported request version")
         tested_sha = bridge.gate(integer(environment("INPUT_SOURCE_RUN_ID")),

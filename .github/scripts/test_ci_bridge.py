@@ -1,10 +1,12 @@
 import base64
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, unquote
 
 import ci_bridge as bridge
@@ -139,6 +141,10 @@ class BridgeTests(unittest.TestCase):
         self.control = bridge.Bridge(CONFIG, Api(self.provider, False), Api(self.provider, True), REVISION,
                                      self.clock, self.clock.pause)
 
+    def dispatch(self):
+        self.control.prepare(self.control.source_request(11, 1))
+        return self.control.dispatch(11, 1)
+
     def posts(self):
         return [call for call in self.provider.mutations if call[2].endswith("/dispatches")]
 
@@ -158,7 +164,7 @@ class BridgeTests(unittest.TestCase):
         self.assertNotEqual(bridge.digest(request), bridge.digest({**request, "version": 1}))
 
     def test_normal_gate_and_result_acceptance(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.assertEqual(self.control.gate(11, 1, claim["request_digest"], claim["nonce"], 21, 1, REVISION), SOURCE_SHA)
         self.complete()
         result = self.control.wait(11, 1)
@@ -168,33 +174,33 @@ class BridgeTests(unittest.TestCase):
 
     def test_lost_dispatch_response_never_reposts_even_after_restart(self):
         self.provider.lost_post = True
-        self.assertEqual(self.control.dispatch(11, 1)["public_run_id"], 21)
-        self.assertEqual(self.control.dispatch(11, 1)["public_run_id"], 21)
+        self.assertEqual(self.dispatch()["public_run_id"], 21)
+        self.assertEqual(self.dispatch()["public_run_id"], 21)
         self.assertEqual(len(self.posts()), 1)
 
     def test_uncertain_reservation_never_grants_permission(self):
         self.provider.lose_write = lambda value: value['nonce'] is not None
         with self.assertRaises(bridge.Stopped):
-            self.control.dispatch(11, 1)
+            self.dispatch()
         self.assertEqual(len(self.provider.files), 1)  # Write really took effect.
         with self.assertRaises(bridge.Stopped):
-            self.control.dispatch(11, 1)
+            self.dispatch()
         self.assertEqual(self.posts(), [])
 
     def test_lost_binding_response_requires_exact_intended_readback(self):
         self.provider.lose_write = lambda value: value["public_run_id"] is not None
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.assertEqual(claim["public_run_id"], 21)
         self.assertEqual(len(self.posts()), 1)
 
     def test_binding_is_immutable(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.provider.runs[22] = self.provider.run(22, claim["request_digest"], claim["nonce"])
         with self.assertRaisesRegex(bridge.Stopped, "immutable"):
             self.control.bind(claim["request"], self.control.claim(claim["request"]), 22)
 
     def test_wrong_public_provenance_is_rejected(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.complete()
         for key, value in (("head_sha", "f" * 40), ("run_attempt", 2), ("actor", {"id": 999})):
             with self.subTest(key=key):
@@ -205,14 +211,14 @@ class BridgeTests(unittest.TestCase):
                 self.provider.runs[21][key] = original
 
     def test_success_after_original_deadline_is_rejected(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.complete()
         self.clock.value = claim["request"]["deadline"]
         with self.assertRaisesRegex(bridge.Stopped, "deadline"):
             self.control.verify_results(claim)
 
     def test_wrong_job_run_identity_is_rejected(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.complete()
         original = self.control.public.request
 
@@ -227,13 +233,13 @@ class BridgeTests(unittest.TestCase):
             self.control.verify_results(claim)
 
     def test_source_attempt_change_revokes_gate(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.provider.source["run_attempt"] = 2
         with self.assertRaises(bridge.Stopped):
             self.control.gate(11, 1, claim["request_digest"], claim["nonce"], 21, 1, REVISION)
 
     def test_cancel_acknowledgement_is_not_terminal_receipt(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.provider.source["status"] = "completed"
         self.control.reconcile_claim(self.control.path(claim["request"]))
         self.assertTrue(any(call[2].endswith("/cancel") for call in self.provider.mutations))
@@ -244,6 +250,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_delivery_created_after_deadline_is_cancelled_then_observed(self):
         request = self.control.source_request(11, 1)
+        self.control.prepare(request)
         (claim, _), _ = self.control.acquire(request)
         self.clock.value = request["deadline"] + 10
         self.provider.runs[21] = self.provider.run(21, claim["request_digest"], claim["nonce"])
@@ -263,7 +270,7 @@ class BridgeTests(unittest.TestCase):
         claim, _ = self.control.prepare(request)
         self.assertIsNone(claim["nonce"])
         self.assertEqual(self.posts(), [])
-        self.assertEqual(self.control.dispatch(11, 1)["public_run_id"], 21)
+        self.assertEqual(self.dispatch()["public_run_id"], 21)
         self.assertEqual(len(self.posts()), 1)
 
     def test_historical_v1_attempt_cannot_dispatch(self):
@@ -271,12 +278,12 @@ class BridgeTests(unittest.TestCase):
         legacy_path = self.control.path(request).removeprefix("v2/")
         self.control.put_file(legacy_path, {"version": 1})
         with self.assertRaisesRegex(bridge.Stopped, "Historical V1"):
-            self.control.dispatch(11, 1)
+            self.dispatch()
         self.assertEqual(self.posts(), [])
         self.assertEqual(self.control.reconcile(11, 1), {"state": "no_v2_claim"})
 
     def test_unknown_core_status_cannot_cancel(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         request = self.control.core.request
 
         def unavailable(path, *args, **kwargs):
@@ -291,7 +298,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.control.claim(claim["request"])[0], claim)
 
     def test_only_duplicate_is_cancelled_when_bound_worker_is_active(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.provider.runs[22] = self.provider.run(22, claim["request_digest"], claim["nonce"])
         self.control.reconcile(11, 1)
         self.control.reconcile(11, 1)
@@ -301,6 +308,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_ambiguous_unbound_workers_close_before_cancellation(self):
         request = self.control.source_request(11, 1)
+        self.control.prepare(request)
         (claim, _), _ = self.control.acquire(request)
         for run_id in (21, 22):
             self.provider.runs[run_id] = self.provider.run(run_id, claim["request_digest"], claim["nonce"])
@@ -310,7 +318,7 @@ class BridgeTests(unittest.TestCase):
             self.control.gate(11, 1, claim["request_digest"], claim["nonce"], 21, 1, REVISION)
 
     def test_lost_result_ack_uses_canonical_success_without_second_write(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.complete()
         self.provider.lose_write = lambda value: value["decision"] == "success"
         result = self.control.wait(11, 1)
@@ -321,7 +329,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result["request"], claim["request"])
 
     def test_closing_decision_wins_over_stale_success_cas(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.complete()
         update = self.control.update
 
@@ -336,7 +344,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.control.claim(claim["request"])[0]["decision"], "source_closed")
 
     def test_success_survives_source_completion_and_watchdog_settles(self):
-        claim = self.control.dispatch(11, 1)
+        claim = self.dispatch()
         self.complete()
         self.control.wait(11, 1)
         self.provider.source["status"] = "completed"
@@ -347,7 +355,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.cancellations(), [])
 
     def test_lost_cancel_post_is_observed_and_never_repeated(self):
-        self.control.dispatch(11, 1)
+        self.dispatch()
         self.provider.source["status"] = "completed"
         self.provider.lost_cancel = True
         with self.assertRaises(bridge.ApiFailure):
@@ -359,7 +367,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.control.reconcile(11, 1)["state"], "settled")
 
     def test_lost_cancel_reservation_ack_does_not_authorize_post(self):
-        self.control.dispatch(11, 1)
+        self.dispatch()
         self.provider.source["status"] = "completed"
         self.provider.lose_write = lambda value: value["workers"].get("21") == "cancel_reserved"
         with self.assertRaises(bridge.ApiFailure):
@@ -370,6 +378,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_expired_unbound_claim_is_fenced_and_late_worker_is_still_found(self):
         request = self.control.source_request(11, 1)
+        self.control.prepare(request)
         (claim, _), _ = self.control.acquire(request)
         self.clock.value = request["deadline"]
         self.assertEqual(self.control.reconcile(11, 1)["state"], "pending")
@@ -396,6 +405,64 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(visited, paths[:bridge.SWEEP_BATCH])
         self.control.reconcile()
         self.assertEqual(visited[bridge.SWEEP_BATCH:bridge.SWEEP_BATCH + 2], paths[-2:])
+
+    def test_dispatch_observes_request_published_by_source_ci(self):
+        request = self.control.source_request(11, 1)
+
+        def publish_on_first_poll(seconds):
+            self.clock.pause(seconds)
+            self.control.prepare(request)
+
+        self.control.pause = publish_on_first_poll
+        self.assertEqual(self.control.dispatch(11, 1)["public_run_id"], 21)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_dispatch_without_publication_expires_without_granting_authority(self):
+        with self.assertRaisesRegex(bridge.Stopped, "publication deadline"):
+            self.control.dispatch(11, 1)
+        self.assertFalse(self.provider.files)
+        self.assertEqual(self.posts(), [])
+
+    def test_wait_publishes_and_observes_separate_dispatch(self):
+        def dispatch_on_first_poll(seconds):
+            self.clock.pause(seconds)
+            self.control.dispatch(11, 1)
+            self.complete()
+
+        self.control.pause = dispatch_on_first_poll
+        self.assertEqual(self.control.wait(11, 1)["decision"], "success")
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_wait_without_dispatch_expires_without_granting_authority(self):
+        request = self.control.source_request(11, 1)
+        self.control.pause = lambda _: setattr(self.clock, "value", request["deadline"])
+        with self.assertRaisesRegex(bridge.Stopped, "deadline"):
+            self.control.wait(11, 1)
+        self.assertIsNone(self.control.claim(request)[0]["nonce"])
+        self.assertEqual(self.posts(), [])
+
+    def test_reconcile_routes_source_completion_to_exact_attempt(self):
+        env = {"GITHUB_EVENT_NAME": "workflow_run", "COMPLETED_WORKFLOW": "CI",
+               "COMPLETED_RUN_ID": "11", "COMPLETED_RUN_ATTEMPT": "2"}
+        with patch.dict(os.environ, env, clear=True), patch.object(self.control, "reconcile") as reconcile:
+            bridge.reconcile_event(self.control)
+            reconcile.assert_called_once_with(11, 2)
+
+    def test_reconcile_routes_dispatch_completion_schedule_and_manual_to_sweep(self):
+        for event in ("workflow_run", "schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                env = {"GITHUB_EVENT_NAME": event, "COMPLETED_WORKFLOW": "Dispatch public CI",
+                       "COMPLETED_RUN_ID": "99", "COMPLETED_RUN_ATTEMPT": "2"}
+                with patch.dict(os.environ, env, clear=True), patch.object(self.control, "reconcile") as reconcile:
+                    bridge.reconcile_event(self.control)
+                    reconcile.assert_called_once_with()
+
+    def test_reconcile_rejects_unknown_workflow(self):
+        env = {"GITHUB_EVENT_NAME": "workflow_run", "COMPLETED_WORKFLOW": "Release image"}
+        with patch.dict(os.environ, env, clear=True), patch.object(self.control, "reconcile") as reconcile:
+            with self.assertRaisesRegex(bridge.Stopped, "Unexpected completed workflow"):
+                bridge.reconcile_event(self.control)
+            reconcile.assert_not_called()
 
     def test_private_wrapper_suppresses_output_and_command_files(self):
         with tempfile.TemporaryDirectory() as directory:
