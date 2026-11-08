@@ -1,67 +1,31 @@
-name: '[ci][pr·main·core-request][gh-linux] Build & Test'
-run-name: ${{ github.event_name == 'workflow_dispatch' && format('bridge:v2:{0}:{1}:{2}:{3}', inputs.source_run_id, inputs.source_attempt, inputs.request_digest, inputs.claim_nonce) || 'Check public CI control' }}
+name: '[ci][core-request][gh-linux] Build & Test'
+run-name: Core ci ${{ fromJSON(inputs.request).request.run_id }}.${{ fromJSON(inputs.request).request.attempt }} ${{ fromJSON(inputs.request).request.tested_sha }}
 
 on:
-  push:
-    branches: [main]
-    paths: [.github/**]
-  pull_request:
-    paths: [.github/**]
   workflow_dispatch:
     inputs:
-      request_version:
-        required: true
-        type: string
-      source_run_id:
-        required: true
-        type: string
-      source_attempt:
-        required: true
-        type: string
-      request_digest:
-        required: true
-        type: string
-      claim_nonce:
+      request:
+        description: Immutable Core CI request
         required: true
         type: string
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  control:
-    name: Control
-    if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: python3 -m unittest discover -s .github/scripts -p test_ci_bridge.py -v
-      - run: shellcheck .github/scripts/*.sh
-      - run: git diff --check
-
   rust:
     name: Rust
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.repository_id == '1444279727' && github.ref == 'refs/heads/main' &&
+      github.actor_id == '352203391' && github.run_attempt == 1
     runs-on: ubuntu-26.04
     timeout-minutes: 45
-    permissions:
-      contents: read
-      actions: read
     defaults:
       run:
         working-directory: .control
     steps:
-      - name: Check out trusted public control
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          path: .control
-          persist-credentials: false
-          sparse-checkout: .github
-      - name: Mint private read token
+      - name: Mint scoped Core read token
         id: reader
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
@@ -72,27 +36,37 @@ jobs:
           permission-contents: read
           permission-actions: read
           skip-token-revoke: true
-      - name: Validate immutable dispatch binding
+      - name: Checkout trusted private CI control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cagojeiger/mossden-core
+          ref: main
+          token: ${{ steps.reader.outputs.token }}
+          path: .control
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Validate immutable Core request
         id: gate
         env:
-          CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
-          PUBLIC_TOKEN: ${{ github.token }}
-          PUBLIC_CI_REVISION: ${{ github.sha }}
-          INPUT_REQUEST_VERSION: ${{ inputs.request_version }}
-          INPUT_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-          INPUT_SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
-          INPUT_REQUEST_DIGEST: ${{ inputs.request_digest }}
-          INPUT_CLAIM_NONCE: ${{ inputs.claim_nonce }}
-        run: python3 .github/scripts/ci_bridge.py gate
+          CORE_TOKEN: ${{ steps.reader.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ inputs.request }}
+        run: python3 .github/scripts/ci_bridge.py gate >> "$GITHUB_OUTPUT"
       - name: Fetch exact private source and revoke read token
+        id: source
         env:
           CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
           TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
         run: bash .github/scripts/private_run.sh bash .github/scripts/checkout_core.sh
       - name: Check Rust and container
         run: bash .github/scripts/private_run.sh make -C source release-check
-      - name: Ensure private token is revoked
-        if: always() && steps.reader.outputs.token != ''
+      - name: Ensure Core read token is revoked after setup failure
+        if: always() && steps.reader.outputs.token != '' && steps.source.outcome != 'success'
+        working-directory: ${{ github.workspace }}
         env:
           CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
-        run: bash .github/scripts/private_run.sh bash .github/scripts/revoke_core_token.sh
+        run: |
+          status=$(printf 'header = "Authorization: Bearer %s"\n' "$CORE_READ_TOKEN" |
+            curl --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
+              --request DELETE --config - https://api.github.com/installation/token)
+          test "$status" = 204 || test "$status" = 401
