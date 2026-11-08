@@ -1,4 +1,4 @@
-name: CI
+name: '[ci][pr·main·core-request][gh-linux] Build & Test'
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('bridge:v2:{0}:{1}:{2}:{3}', inputs.source_run_id, inputs.source_attempt, inputs.request_digest, inputs.claim_nonce) || 'Check public CI control' }}
 
 on:
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: python3 -m unittest discover -s .github/scripts -p test_ci_bridge.py -v
@@ -55,7 +55,7 @@ jobs:
         working-directory: .control
     steps:
       - name: Check out trusted public control
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           path: .control
