@@ -1,5 +1,5 @@
 name: CI
-run-name: ${{ github.event_name == 'workflow_dispatch' && format('bridge:{0}:{1}', inputs.request_digest, inputs.claim_nonce) || 'Check public CI control' }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('bridge:v2:{0}:{1}:{2}:{3}', inputs.source_run_id, inputs.source_attempt, inputs.request_digest, inputs.claim_nonce) || 'Check public CI control' }}
 
 on:
   push:
@@ -9,6 +9,9 @@ on:
     paths: [.github/**]
   workflow_dispatch:
     inputs:
+      request_version:
+        required: true
+        type: string
       source_run_id:
         required: true
         type: string
@@ -75,6 +78,7 @@ jobs:
           CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
           PUBLIC_TOKEN: ${{ github.token }}
           PUBLIC_CI_REVISION: ${{ github.sha }}
+          INPUT_REQUEST_VERSION: ${{ inputs.request_version }}
           INPUT_SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           INPUT_SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
           INPUT_REQUEST_DIGEST: ${{ inputs.request_digest }}
