@@ -56,8 +56,11 @@ jobs:
         id: source
         env:
           CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          CORE_CONTROL_SHA: ${{ steps.gate.outputs.core_sha }}
           TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
-        run: bash .github/scripts/private_run.sh bash .github/scripts/checkout_core.sh
+        run: |
+          test "$(git rev-parse HEAD)" = "$CORE_CONTROL_SHA"
+          bash .github/scripts/private_run.sh bash .github/scripts/checkout_core.sh
       - name: Check Rust and container
         run: bash .github/scripts/private_run.sh make -C source release-check
       - name: Ensure Core read token is revoked after setup failure
