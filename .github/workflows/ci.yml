@@ -13,6 +13,10 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: mossden-ci-${{ fromJSON(inputs.request).request.event == 'pull_request' && format('pr-{0}', fromJSON(inputs.request).request.pr_number) || format('run-{0}', fromJSON(inputs.request).request.run_id) }}
+  cancel-in-progress: ${{ fromJSON(inputs.request).request.event == 'pull_request' }}
+
 jobs:
   rust:
     name: Rust
@@ -52,14 +56,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REQUEST_JSON: ${{ inputs.request }}
         run: python3 .github/scripts/ci_bridge.py gate >> "$GITHUB_OUTPUT"
+      - name: Checkout the requested private worker control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cagojeiger/mossden-core
+          ref: ${{ steps.gate.outputs.core_sha }}
+          token: ${{ steps.reader.outputs.token }}
+          path: .control
+          persist-credentials: false
+          sparse-checkout: .github/scripts
       - name: Fetch exact private source and revoke read token
         id: source
         env:
           CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          CORE_TOKEN: ${{ steps.reader.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ inputs.request }}
           CORE_CONTROL_SHA: ${{ steps.gate.outputs.core_sha }}
           TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$CORE_CONTROL_SHA"
+          python3 .github/scripts/ci_bridge.py worker
           bash .github/scripts/private_run.sh bash .github/scripts/checkout_core.sh
       - name: Check Rust and container
         run: bash .github/scripts/private_run.sh make -C source release-check
