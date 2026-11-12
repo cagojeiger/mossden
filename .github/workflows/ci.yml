@@ -98,16 +98,29 @@ jobs:
       rust: ${{ needs.gate.outputs.rust == 'true' }}
     secrets: inherit
 
+  audit:
+    name: Rust Audit
+    needs: gate
+    uses: ./.github/workflows/ci-worker.yml
+    with:
+      check: audit
+      request: ${{ inputs.request }}
+      core_sha: ${{ needs.gate.outputs.core_sha }}
+      tested_sha: ${{ needs.gate.outputs.tested_sha }}
+      rust: ${{ needs.gate.outputs.rust == 'true' }}
+    secrets: inherit
+
   result:
     name: Rust
     if: always()
-    needs: [gate, hygiene, lint, build]
+    needs: [gate, hygiene, lint, build, audit]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Require the selected checks
         env:
           GATE_RESULT: ${{ needs.gate.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
           HYGIENE_RESULT: ${{ needs.hygiene.result }}
           LINT_RESULT: ${{ needs.lint.result }}
           BUILD_RESULT: ${{ needs.build.result }}
@@ -115,6 +128,7 @@ jobs:
         run: |
           test "$GATE_RESULT" = success
           test "$HYGIENE_RESULT" = success
+          test "$AUDIT_RESULT" = success
           expected=skipped
           if [[ "$RUN_RUST" == true ]]; then expected=success; fi
           test "$LINT_RESULT" = "$expected"
