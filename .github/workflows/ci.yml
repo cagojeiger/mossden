@@ -29,7 +29,6 @@ jobs:
       core_sha: ${{ steps.gate.outputs.core_sha }}
       tested_sha: ${{ steps.gate.outputs.tested_sha }}
       rust: ${{ steps.gate.outputs.rust }}
-      scope: ${{ steps.gate.outputs.scope }}
     steps:
       - name: Mint scoped Core read token
         id: reader
