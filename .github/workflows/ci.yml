@@ -65,49 +65,51 @@ jobs:
   hygiene:
     name: Hygiene
     needs: gate
-    uses: ./.github/workflows/ci-worker.yml
+    uses: cagojeiger/notehub/.github/workflows/rust.yml@main
     with:
-      check: hygiene
+      core: mossden-core
+      task: hygiene
       request: ${{ inputs.request }}
       core_sha: ${{ needs.gate.outputs.core_sha }}
       tested_sha: ${{ needs.gate.outputs.tested_sha }}
-      rust: ${{ needs.gate.outputs.rust == 'true' }}
     secrets: inherit
 
   lint:
+    if: needs.gate.outputs.rust == 'true'
     name: Rust Lint
     needs: gate
-    uses: ./.github/workflows/ci-worker.yml
+    uses: cagojeiger/notehub/.github/workflows/rust.yml@main
     with:
-      check: lint
+      core: mossden-core
+      task: lint
       request: ${{ inputs.request }}
       core_sha: ${{ needs.gate.outputs.core_sha }}
       tested_sha: ${{ needs.gate.outputs.tested_sha }}
-      rust: ${{ needs.gate.outputs.rust == 'true' }}
     secrets: inherit
 
   build:
+    if: needs.gate.outputs.rust == 'true'
     name: Rust Build
     needs: gate
-    uses: ./.github/workflows/ci-worker.yml
+    uses: cagojeiger/notehub/.github/workflows/rust.yml@main
     with:
-      check: build
+      core: mossden-core
+      task: build
       request: ${{ inputs.request }}
       core_sha: ${{ needs.gate.outputs.core_sha }}
       tested_sha: ${{ needs.gate.outputs.tested_sha }}
-      rust: ${{ needs.gate.outputs.rust == 'true' }}
     secrets: inherit
 
   audit:
     name: Rust Audit
     needs: gate
-    uses: ./.github/workflows/ci-worker.yml
+    uses: cagojeiger/notehub/.github/workflows/rust.yml@main
     with:
-      check: audit
+      core: mossden-core
+      task: audit
       request: ${{ inputs.request }}
       core_sha: ${{ needs.gate.outputs.core_sha }}
       tested_sha: ${{ needs.gate.outputs.tested_sha }}
-      rust: ${{ needs.gate.outputs.rust == 'true' }}
     secrets: inherit
 
   result:
