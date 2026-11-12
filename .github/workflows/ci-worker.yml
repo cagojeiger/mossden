@@ -1,0 +1,150 @@
+name: '[ci][workflow-call][gh-linux] Check'
+
+on:
+  workflow_call:
+    inputs:
+      check:
+        required: true
+        type: string
+      request:
+        required: true
+        type: string
+      core_sha:
+        required: true
+        type: string
+      tested_sha:
+        required: true
+        type: string
+      rust:
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  check:
+    name: Check
+    if: >-
+      github.repository_id == '1444279727' && github.ref == 'refs/heads/main' &&
+      github.actor_id == '352203391' && github.run_attempt == 1 &&
+      (inputs.check == 'hygiene' || inputs.rust && contains(fromJSON('["lint","build"]'), inputs.check))
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Mint scoped Core read token
+        id: reader
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          client-id: ${{ vars.CORE_READ_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CORE_READ_APP_PRIVATE_KEY }}
+          owner: cagojeiger
+          repositories: mossden-core
+          permission-contents: read
+          permission-actions: read
+          skip-token-revoke: true
+      - name: Checkout the requested private worker control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cagojeiger/mossden-core
+          ref: ${{ inputs.core_sha }}
+          token: ${{ steps.reader.outputs.token }}
+          path: .control
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Validate worker, fetch source and revoke reader
+        id: source
+        env:
+          CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          CORE_TOKEN: ${{ steps.reader.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_JSON: ${{ inputs.request }}
+          TESTED_SHA: ${{ inputs.tested_sha }}
+        run: |
+          (cd .control && python3 .github/scripts/ci_bridge.py worker)
+          bash .control/.github/scripts/private_run.sh bash .control/.github/scripts/checkout_core.sh
+      - name: Ensure Core reader is revoked after setup failure
+        if: always() && steps.reader.outputs.token != '' && steps.source.outcome != 'success'
+        env:
+          CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
+        run: |
+          status=$(printf 'header = "Authorization: Bearer %s"\n' "$CORE_READ_TOKEN" |
+            curl --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
+              --request DELETE --config - https://api.github.com/installation/token)
+          test "$status" = 204 || test "$status" = 401
+      - name: Check scripts, formatting and whitespace
+        if: inputs.check == 'hygiene'
+        run: |
+          bash .control/.github/scripts/private_run.sh make -C source script-check fmt
+          bash .control/.github/scripts/private_run.sh git -C source diff --check
+      - name: Plan verified crates.io archives
+        if: inputs.check != 'hygiene'
+        id: archives
+        run: python3 .control/.github/scripts/ci_dependency_cache.py plan --kind cargo
+      - name: Restore crates.io archives
+        if: steps.archives.outputs.enabled == 'true'
+        id: archives_restore
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.archives.outputs.path }}
+          key: ${{ steps.archives.outputs.key }}
+      - name: Verify and seed crates.io archives
+        if: steps.archives.outputs.enabled == 'true'
+        id: archives_prepare
+        run: python3 .control/.github/scripts/ci_dependency_cache.py prepare --kind cargo
+      - name: Save verified archives from Core main
+        if: >-
+          inputs.check == 'build' && fromJSON(inputs.request).request.event == 'push' &&
+          steps.archives_prepare.outputs.prepared == 'true' && steps.archives_restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.archives.outputs.path }}
+          key: ${{ steps.archives.outputs.key }}
+      - name: Plan compiled public dependencies
+        if: steps.archives_prepare.outputs.prepared == 'true'
+        id: compiled
+        run: python3 .control/.github/scripts/ci_dependency_cache.py plan --kind cargo-target
+      - name: Restore compiled public dependencies
+        if: steps.compiled.outputs.enabled == 'true'
+        id: compiled_restore
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.compiled.outputs.path }}
+          key: ${{ steps.compiled.outputs.key }}
+      - name: Verify and place compiled dependencies
+        if: steps.compiled_restore.outputs.cache-hit == 'true'
+        id: compiled_prepare
+        run: python3 .control/.github/scripts/ci_dependency_cache.py prepare --kind cargo-target
+      - name: Compile Rust tests
+        if: inputs.check == 'build'
+        working-directory: source
+        run: bash "$GITHUB_WORKSPACE/.control/.github/scripts/private_run.sh" cargo test --locked --workspace --no-run
+      - name: Export compiled public dependencies from Core main
+        if: >-
+          inputs.check == 'build' && fromJSON(inputs.request).request.event == 'push' &&
+          steps.compiled.outputs.enabled == 'true' && steps.compiled_restore.outputs.cache-hit != 'true'
+        id: compiled_export
+        run: python3 .control/.github/scripts/ci_dependency_cache.py export --kind cargo-target
+      - name: Save compiled public dependencies from Core main
+        if: steps.compiled_export.outputs.exported == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.compiled.outputs.path }}
+          key: ${{ steps.compiled.outputs.key }}
+      - name: Check Rust and Clippy
+        if: inputs.check == 'lint'
+        run: bash .control/.github/scripts/private_run.sh make -C source check clippy
+      - name: Test authentication, release build and container
+        if: inputs.check == 'build'
+        run: bash .control/.github/scripts/private_run.sh make -C source test test-auth build image-check
+      - name: Summarize dependency cache
+        if: always() && inputs.check != 'hygiene' && steps.source.outcome == 'success'
+        env:
+          ARCHIVES: ${{ format('archives eligible={0}, hit={1}, prepared={2}, reason={3} {4}', steps.archives.outputs.enabled, steps.archives_restore.outputs.cache-hit, steps.archives_prepare.outputs.prepared, steps.archives.outputs.reason, steps.archives_prepare.outputs.reason) }}
+          COMPILED: ${{ format('compiled eligible={0}, hit={1}, prepared={2}, exported={3}, reason={4} {5} {6}', steps.compiled.outputs.enabled, steps.compiled_restore.outputs.cache-hit, steps.compiled_prepare.outputs.prepared, steps.compiled_export.outputs.exported, steps.compiled.outputs.reason, steps.compiled_prepare.outputs.reason, steps.compiled_export.outputs.reason) }}
+        run: printf '%s\n' "$ARCHIVES" "$COMPILED" >> "$GITHUB_STEP_SUMMARY"
