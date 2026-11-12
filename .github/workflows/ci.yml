@@ -75,26 +75,26 @@ jobs:
     secrets: inherit
 
   lint:
-    if: needs.gate.outputs.rust == 'true'
     name: Rust Lint
     needs: gate
     uses: cagojeiger/notehub/.github/workflows/rust.yml@main
     with:
       core: mossden-core
       task: lint
+      enabled: ${{ needs.gate.outputs.rust == 'true' }}
       request: ${{ inputs.request }}
       core_sha: ${{ needs.gate.outputs.core_sha }}
       tested_sha: ${{ needs.gate.outputs.tested_sha }}
     secrets: inherit
 
   build:
-    if: needs.gate.outputs.rust == 'true'
     name: Rust Build
     needs: gate
     uses: cagojeiger/notehub/.github/workflows/rust.yml@main
     with:
       core: mossden-core
       task: build
+      enabled: ${{ needs.gate.outputs.rust == 'true' }}
       request: ${{ inputs.request }}
       core_sha: ${{ needs.gate.outputs.core_sha }}
       tested_sha: ${{ needs.gate.outputs.tested_sha }}
