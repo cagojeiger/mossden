@@ -18,16 +18,18 @@ concurrency:
   cancel-in-progress: ${{ fromJSON(inputs.request).request.event == 'pull_request' }}
 
 jobs:
-  rust:
-    name: Rust
+  gate:
+    name: Validate core request
     if: >-
       github.repository_id == '1444279727' && github.ref == 'refs/heads/main' &&
       github.actor_id == '352203391' && github.run_attempt == 1
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: .control
+    timeout-minutes: 5
+    outputs:
+      core_sha: ${{ steps.gate.outputs.core_sha }}
+      tested_sha: ${{ steps.gate.outputs.tested_sha }}
+      rust: ${{ steps.gate.outputs.rust }}
+      scope: ${{ steps.gate.outputs.scope }}
     steps:
       - name: Mint scoped Core read token
         id: reader
@@ -39,7 +41,6 @@ jobs:
           repositories: mossden-core
           permission-contents: read
           permission-actions: read
-          skip-token-revoke: true
       - name: Checkout trusted private CI control
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,42 +52,71 @@ jobs:
           sparse-checkout: .github/scripts
       - name: Validate immutable Core request
         id: gate
+        working-directory: .control
         env:
           CORE_TOKEN: ${{ steps.reader.outputs.token }}
           GH_TOKEN: ${{ github.token }}
           REQUEST_JSON: ${{ inputs.request }}
         run: python3 .github/scripts/ci_bridge.py gate >> "$GITHUB_OUTPUT"
-      - name: Checkout the requested private worker control
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: cagojeiger/mossden-core
-          ref: ${{ steps.gate.outputs.core_sha }}
-          token: ${{ steps.reader.outputs.token }}
-          path: .control
-          persist-credentials: false
-          sparse-checkout: .github/scripts
-      - name: Fetch exact private source and revoke read token
-        id: source
+      - name: Summarize selected checks
         env:
-          CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
-          CORE_TOKEN: ${{ steps.reader.outputs.token }}
-          GH_TOKEN: ${{ github.token }}
-          REQUEST_JSON: ${{ inputs.request }}
-          CORE_CONTROL_SHA: ${{ steps.gate.outputs.core_sha }}
-          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
-        run: |
-          test "$(git rev-parse HEAD)" = "$CORE_CONTROL_SHA"
-          python3 .github/scripts/ci_bridge.py worker
-          bash .github/scripts/private_run.sh bash .github/scripts/checkout_core.sh
-      - name: Check Rust and container
-        run: bash .github/scripts/private_run.sh make -C source release-check
-      - name: Ensure Core read token is revoked after setup failure
-        if: always() && steps.reader.outputs.token != '' && steps.source.outcome != 'success'
-        working-directory: ${{ github.workspace }}
+          CHECK_SCOPE: ${{ steps.gate.outputs.scope }}
+        run: printf 'Check scope %s\n' "$CHECK_SCOPE" >> "$GITHUB_STEP_SUMMARY"
+
+  hygiene:
+    name: Hygiene
+    needs: gate
+    uses: ./.github/workflows/ci-worker.yml
+    with:
+      check: hygiene
+      request: ${{ inputs.request }}
+      core_sha: ${{ needs.gate.outputs.core_sha }}
+      tested_sha: ${{ needs.gate.outputs.tested_sha }}
+      rust: ${{ needs.gate.outputs.rust == 'true' }}
+    secrets: inherit
+
+  lint:
+    name: Rust Lint
+    needs: gate
+    uses: ./.github/workflows/ci-worker.yml
+    with:
+      check: lint
+      request: ${{ inputs.request }}
+      core_sha: ${{ needs.gate.outputs.core_sha }}
+      tested_sha: ${{ needs.gate.outputs.tested_sha }}
+      rust: ${{ needs.gate.outputs.rust == 'true' }}
+    secrets: inherit
+
+  build:
+    name: Rust Build
+    needs: gate
+    uses: ./.github/workflows/ci-worker.yml
+    with:
+      check: build
+      request: ${{ inputs.request }}
+      core_sha: ${{ needs.gate.outputs.core_sha }}
+      tested_sha: ${{ needs.gate.outputs.tested_sha }}
+      rust: ${{ needs.gate.outputs.rust == 'true' }}
+    secrets: inherit
+
+  result:
+    name: Rust
+    if: always()
+    needs: [gate, hygiene, lint, build]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the selected checks
         env:
-          CORE_READ_TOKEN: ${{ steps.reader.outputs.token }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          HYGIENE_RESULT: ${{ needs.hygiene.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RUN_RUST: ${{ needs.gate.outputs.rust }}
         run: |
-          status=$(printf 'header = "Authorization: Bearer %s"\n' "$CORE_READ_TOKEN" |
-            curl --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
-              --request DELETE --config - https://api.github.com/installation/token)
-          test "$status" = 204 || test "$status" = 401
+          test "$GATE_RESULT" = success
+          test "$HYGIENE_RESULT" = success
+          expected=skipped
+          if [[ "$RUN_RUST" == true ]]; then expected=success; fi
+          test "$LINT_RESULT" = "$expected"
+          test "$BUILD_RESULT" = "$expected"
