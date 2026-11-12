@@ -85,6 +85,7 @@ jobs:
       - name: Restore crates.io archives
         if: steps.archives.outputs.enabled == 'true'
         id: archives_restore
+        continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.archives.outputs.path }}
@@ -97,6 +98,7 @@ jobs:
         if: >-
           inputs.check == 'build' && fromJSON(inputs.request).request.event == 'push' &&
           steps.archives_prepare.outputs.prepared == 'true' && steps.archives_restore.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.archives.outputs.path }}
@@ -108,6 +110,7 @@ jobs:
       - name: Restore compiled public dependencies
         if: steps.compiled.outputs.enabled == 'true'
         id: compiled_restore
+        continue-on-error: true
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.compiled.outputs.path }}
@@ -128,6 +131,7 @@ jobs:
         run: python3 .control/.github/scripts/ci_dependency_cache.py export --kind cargo-target
       - name: Save compiled public dependencies from Core main
         if: steps.compiled_export.outputs.exported == 'true'
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.compiled.outputs.path }}
